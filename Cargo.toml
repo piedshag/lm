@@ -1,7 +1,17 @@
 [package]
 name = "lm"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+burn = { version = "0.18.0", features = ["ndarray", "metal", "wgpu"] }
+burn-import = "0.18.0"
+ndarray = { version = "0.16.1", features = ["rayon"] }
+ndarray-rand = "0.15.0"
+burn-ndarray = "0.18.0"
+hf-hub = "0.4.3"
+serde = "1.0.219"
+sysinfo = "0.30.12"
+tokenizers = "0.21.2"
+rand = "0.8.5"
 
