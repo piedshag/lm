@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-burn = { version = "0.18.0", features = ["ndarray", "metal", "wgpu"] }
+burn = { version = "0.18.0", features = ["ndarray", "metal", "wgpu", "candle", "tch"] }
 burn-import = "0.18.0"
+burn-common = "0.18.0"
+burn-candle = "0.18.0"
 ndarray = { version = "0.16.1", features = ["rayon"] }
 ndarray-rand = "0.15.0"
 burn-ndarray = "0.18.0"
@@ -14,4 +16,8 @@ serde = "1.0.219"
 sysinfo = "0.30.12"
 tokenizers = "0.21.2"
 rand = "0.8.5"
+candle-transformers = {path = "../candle/candle-transformers" }
+candle-nn =  {path = "../candle/candle-nn" }
+candle-core =  {path = "../candle/candle-core" }
+serde_json = "1.0.141"
 

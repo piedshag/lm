@@ -1,12 +1,92 @@
 use burn::{
+    backend::{candle::CandleTensor, Candle},
     config::Config,
     module::{Module, Param},
-    nn::{self, Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RotaryEncodingConfig},
-    record::{FileRecorder, HalfPrecisionSettings, Recorder, RecorderError},
+    nn::{
+        self, attention::generate_autoregressive_mask, Embedding, EmbeddingConfig, Linear,
+        LinearConfig, RmsNorm, RotaryEncoding,
+    },
+    record::{FileRecorder, FullPrecisionSettings, HalfPrecisionSettings, Recorder, RecorderError},
     serde::Deserialize,
-    tensor::{activation, backend::Backend, Bool, Device, Int, Tensor},
+    tensor::{
+        activation, backend::Backend, Bool, Device, Int, Tensor, TensorData, TensorPrimitive,
+    },
 };
-use burn_import::safetensors::{LoadArgs, SafetensorsFileRecorder};
+use burn_import::safetensors::{AdapterType, LoadArgs, SafetensorsFileRecorder};
+use burn_ndarray::NdArrayTensor;
+use rand::seq;
+
+fn print_tensor<B: Backend, const D: usize>(name: &str, tensor: &Tensor<B, D>) {
+    return;
+
+    println!(
+        "{} shape {:?} hash {}",
+        name,
+        tensor.dims(),
+        tensor_hash(tensor)
+    );
+}
+
+fn rotate_half<B: Backend>(xs: Tensor<B, 4>) -> Tensor<B, 4> {
+    let last_dim = xs.dims()[3];
+    let xs1 = xs.clone().narrow(3, 0, last_dim / 2);
+    let xs2 = xs.narrow(3, last_dim / 2, last_dim - last_dim / 2);
+    Tensor::cat(vec![xs2.neg(), xs1], 3)
+}
+
+pub fn rope_slow<B: Backend>(
+    x: Tensor<B, 4>,
+    cos: Tensor<B, 2>,
+    sin: Tensor<B, 2>,
+) -> Tensor<B, 4> {
+    let [_b_sz, _h, seq_len, _n_embd] = x.dims();
+    let cos = Tensor::cat(vec![cos.clone(), cos], 1);
+    let sin = Tensor::cat(vec![sin.clone(), sin], 1);
+    let cos = cos.narrow(0, 0, seq_len);
+    let sin = sin.narrow(0, 0, seq_len);
+    let cos = cos.unsqueeze();
+    let sin = sin.unsqueeze();
+    x.clone().mul(cos) + rotate_half(x).mul(sin)
+}
+
+#[derive(Module, Debug)]
+pub struct RotaryEmbedding<B: Backend> {
+    cos: Tensor<B, 2>,
+    sin: Tensor<B, 2>,
+}
+
+impl<B: Backend> RotaryEmbedding<B> {
+    pub fn new(
+        base: f32,
+        head_dim: usize,
+        max_position_embeddings: usize,
+        device: &Device<B>,
+    ) -> Self {
+        let inv_freq: Vec<_> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_data(TensorData::new(inv_freq, [1, inv_freq_len]), device);
+        let t: Tensor<B, 2> = Tensor::arange(0i64..max_position_embeddings as i64, device)
+            .float()
+            .reshape([max_position_embeddings, 1]);
+
+        let freqs = t.matmul(inv_freq);
+        let sin = freqs.clone().sin();
+        let cos = freqs.cos();
+
+        Self { sin, cos }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 4>, offset: usize) -> Tensor<B, 4> {
+        let [_b_sz, _qh, seq_len, _n_embd] = x.dims();
+        let cos = self.cos.clone().narrow(0, offset, seq_len);
+        let sin = self.sin.clone().narrow(0, offset, seq_len);
+
+        rope_slow(x, cos, sin)
+    }
+}
 
 /// Cache for key-value pairs in attention layers.
 #[derive(Debug, Clone)]
@@ -55,7 +135,6 @@ pub struct Qwen2Config {
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
     pub rope_theta: f32,
-    #[config(default = "1e-6")]
     pub rms_norm_eps: f64,
 }
 
@@ -63,7 +142,7 @@ pub struct Qwen2Config {
 pub struct Qwen2Model<B: Backend> {
     pub model: Qwen2ModelBase<B>,
     pub lm_head: nn::Linear<B>,
-    pub rotary_emb: nn::RotaryEncoding<B>,
+    pub rotary_emb: RotaryEmbedding<B>,
     pub cache: Vec<KeyValueCache<B>>,
     pub device: Device<B>,
 }
@@ -72,9 +151,12 @@ impl<B: Backend> Qwen2Model<B> {
     pub fn new(config: &Qwen2Config, device: &Device<B>) -> Self {
         let model = Qwen2ModelBase::new(config, device);
         let head_dim = config.hidden_size / config.num_attention_heads;
-        let rotary_emb = RotaryEncodingConfig::new(config.max_position_embeddings, head_dim)
-            .with_theta(config.rope_theta)
-            .init(device);
+        let rotary_emb = RotaryEmbedding::new(
+            config.rope_theta,
+            head_dim,
+            config.max_position_embeddings,
+            device,
+        );
 
         let lm_head = nn::LinearConfig::new(config.hidden_size, config.vocab_size)
             .with_bias(false)
@@ -94,31 +176,59 @@ impl<B: Backend> Qwen2Model<B> {
     }
 
     pub fn load(mut self, file_path: &str) -> Result<Self, RecorderError> {
-        let recorder = SafetensorsFileRecorder::<HalfPrecisionSettings>::new();
+        let recorder = SafetensorsFileRecorder::<FullPrecisionSettings>::new();
         let load_args = LoadArgs::new(file_path.into())
             .with_key_remap("model\\.(.+)", "$1")
-            .with_key_remap("(.*)norm\\.weight", "${1}norm.gamma");
+            .with_key_remap("(.*)norm\\.weight", "${1}norm.gamma")
+            .with_adapter_type(AdapterType::PyTorch);
 
         let record = recorder.load(load_args, &self.device).unwrap();
         self.model = self.model.load_record(record);
 
-        // The small model uses tied embeddings, so we need to set the lm_head.weight to the
-        // embed_tokens.weight
-        let weights = self.model.embed_tokens.weight.val();
-        self.lm_head.weight = Param::from_tensor(weights.transpose());
-
+        load_lm_head(&mut self, file_path).unwrap();
         Ok(self)
     }
 
     pub fn forward(&mut self, x: Tensor<B, 2, Int>, pos: usize) -> Tensor<B, 3> {
+        let seq_len = x.dims()[1];
         let now = std::time::Instant::now();
         let hidden_states = self
             .model
-            .forward(x, pos, &mut self.cache, &self.rotary_emb);
+            .forward(x, pos, &mut self.cache, &self.rotary_emb)
+            .narrow(1, seq_len - 1, 1);
+
+        print_tensor("hidden_states", &hidden_states);
+
+        println!("lm_head: {:?}", self.lm_head.weight.val().dims());
         let output = self.lm_head.forward(hidden_states);
         println!("forward time: {:?}", now.elapsed());
+
+        print_tensor("output", &output);
         output
     }
+}
+
+pub fn load_lm_head<B: Backend>(
+    model: &mut Qwen2Model<B>,
+    file_path: &str,
+) -> Result<(), RecorderError> {
+    // The small model uses tied embeddings, so we need to set the lm_head.weight to the
+    // embed_tokens.weight
+
+    // VERY IMPORTANT that you transpose the weights before creating the tensor
+    // transpose creates a view of the tensor which needs to be reshaped when we forward pass
+    // this ends up being very slow
+    let weights = model
+        .model
+        .embed_tokens
+        .weight
+        .val()
+        .transpose()
+        .into_data();
+    let tensor = Tensor::from_data(weights, &model.device);
+    model.lm_head.weight = Param::from_tensor(tensor);
+
+    Ok(())
 }
 
 #[derive(Module, Debug)]
@@ -134,6 +244,7 @@ impl<B: Backend> Qwen2ModelBase<B> {
         let layers = (0..config.num_hidden_layers)
             .map(|_| DecoderLayer::new(config, device))
             .collect();
+
         let norm = nn::RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
             .init(device);
@@ -150,23 +261,35 @@ impl<B: Backend> Qwen2ModelBase<B> {
         x: Tensor<B, 2, Int>,
         pos: usize,
         cache: &mut [KeyValueCache<B>],
-        rotary_emb: &nn::RotaryEncoding<B>,
+        rotary_emb: &RotaryEmbedding<B>,
     ) -> Tensor<B, 3> {
-        let [_batch_size, seq_len] = x.dims();
+        let [batch_size, seq_len] = x.dims();
         let mut x = self.embed_tokens.forward(x);
 
+        // Log after embedding.
+        print_tensor("[Model] after embed_tokens", &x);
+
         let mask = if seq_len > 1 {
-            let mask: Tensor<B, 2, Int> = Tensor::ones([seq_len, seq_len], &x.device()).triu(1);
-            Some(mask.equal_elem(1))
+            Some(generate_autoregressive_mask(
+                batch_size,
+                seq_len,
+                &x.device(),
+            ))
         } else {
             None
         };
 
         for (i, layer) in self.layers.iter().enumerate() {
+            print_tensor(&format!("[Model] ↓ Layer {i:02}  input"), &x);
             x = layer.forward(x, pos, &mut cache[i], mask.as_ref(), rotary_emb);
+            print_tensor(&format!("[Model] ↑ Layer {i:02}  output"), &x);
         }
 
-        self.norm.forward(x)
+        let x = self.norm.forward(x);
+
+        print_tensor("[Model] Norm output", &x);
+
+        x
     }
 }
 
@@ -182,12 +305,19 @@ impl<B: Backend> DecoderLayer<B> {
     pub fn new(config: &Qwen2Config, device: &Device<B>) -> Self {
         let self_attn = Attention::new(config, device);
         let mlp = Mlp::new(config, device);
+
         let input_layernorm = nn::RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
             .init(device);
+
         let post_attention_layernorm = nn::RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
             .init(device);
+
+        println!(
+            "post_attention_layernorm hidden_size: {}, rms_norm_eps: {}",
+            config.hidden_size, config.rms_norm_eps
+        );
 
         Self {
             self_attn,
@@ -202,17 +332,32 @@ impl<B: Backend> DecoderLayer<B> {
         x: Tensor<B, 3>,
         pos: usize,
         cache: &mut KeyValueCache<B>,
-        mask: Option<&Tensor<B, 2, Bool>>,
-        rotary_emb: &nn::RotaryEncoding<B>,
+        mask: Option<&Tensor<B, 3, Bool>>,
+        rotary_emb: &RotaryEmbedding<B>,
     ) -> Tensor<B, 3> {
+        // Input tensor.
         let residual = x.clone();
+        print_tensor("  [DecoderLayer]     input", &residual);
+
         let x_norm = self.input_layernorm.forward(x);
+        print_tensor("  [DecoderLayer] after layernorm", &x_norm);
+
         let attn_output = self.self_attn.forward(x_norm, pos, cache, mask, rotary_emb);
-        let x = residual + attn_output;
+        print_tensor("  [DecoderLayer] after self_attn", &attn_output);
+
+        let x = attn_output + residual;
+
+        print_tensor("  [DecoderLayer] post_attention_layernorm input", &x);
 
         let residual = x.clone();
         let x_norm = self.post_attention_layernorm.forward(x);
+
+        print_tensor("  [DecoderLayer] post_attention_layernorm", &x_norm);
+
         let mlp_output = self.mlp.forward(x_norm);
+
+        print_tensor("  [DecoderLayer] after MLP", &mlp_output);
+
         residual + mlp_output
     }
 }
@@ -264,36 +409,57 @@ impl<B: Backend> Attention<B> {
         x: Tensor<B, 3>,
         pos: usize,
         cache: &mut KeyValueCache<B>,
-        mask: Option<&Tensor<B, 2, Bool>>,
-        rotary_emb: &nn::RotaryEncoding<B>,
+        mask: Option<&Tensor<B, 3, Bool>>,
+        rotary_emb: &RotaryEmbedding<B>,
     ) -> Tensor<B, 3> {
         let [batch_size, seq_len, _hidden_size] = x.dims();
 
         let query_states = self.q_proj.forward(x.clone());
+        // Debug: hash of raw Q projections.
+        print_tensor("    [Attention] q_proj", &query_states);
         let key_states = self.k_proj.forward(x.clone());
+        print_tensor("    [Attention] k_proj", &key_states);
         let value_states = self.v_proj.forward(x);
+        print_tensor("    [Attention] v_proj", &value_states);
 
         let query_states = query_states
             .reshape([batch_size, seq_len, self.num_attention_heads, self.head_dim])
-            .swap_dims(1, 2); // [batch_size, num_heads, seq_len, head_dim]
+            .swap_dims(1, 2) // [batch_size, num_heads, seq_len, head_dim]
+            .clone();
         let key_states = key_states
             .reshape([batch_size, seq_len, self.num_key_value_heads, self.head_dim])
-            .swap_dims(1, 2); // [batch_size, num_kv_heads, seq_len, head_dim]
+            .swap_dims(1, 2) // [batch_size, num_kv_heads, seq_len, head_dim]
+            .clone();
         let value_states = value_states
             .reshape([batch_size, seq_len, self.num_key_value_heads, self.head_dim])
-            .swap_dims(1, 2); // [batch_size, num_kv_heads, seq_len, head_dim]
+            .swap_dims(1, 2) // [batch_size, num_kv_heads, seq_len, head_dim]
+            .clone();
 
-        let query_states = rotary_emb.apply::<4>(query_states, pos);
-        let key_states = rotary_emb.apply::<4>(key_states, pos);
+        print_tensor("    [Attention] Q reshaped", &query_states);
+        print_tensor("    [Attention] K reshaped", &key_states);
+        print_tensor("    [Attention] V reshaped", &value_states);
+
+        let query_states = rotary_emb.forward(query_states, pos);
+        let key_states = rotary_emb.forward(key_states, pos);
+
+        print_tensor("    [Attention] after RoPE Q", &query_states);
+        print_tensor("    [Attention] after RoPE K", &key_states);
 
         let (key_states, value_states) = cache.update(key_states, value_states);
-        let attn_output = self.attention(query_states, key_states, value_states, mask);
 
+        // Hashes after cache update.
+        print_tensor("    [Attention] after cache K", &key_states);
+        print_tensor("    [Attention] after cache V", &value_states);
+
+        let attn_output = self.attention(query_states, key_states, value_states, mask);
         let attn_output = attn_output.swap_dims(1, 2).reshape([
             batch_size,
             seq_len,
             self.num_attention_heads * self.head_dim,
         ]);
+
+        print_tensor("    [Attention] attn_output_reshape", &attn_output);
+
         self.o_proj.forward(attn_output)
     }
 
@@ -302,24 +468,33 @@ impl<B: Backend> Attention<B> {
         query: Tensor<B, 4>,
         key: Tensor<B, 4>,
         value: Tensor<B, 4>,
-        mask: Option<&Tensor<B, 2, Bool>>,
+        mask: Option<&Tensor<B, 3, Bool>>,
     ) -> Tensor<B, 4> {
         let [_batch_size, num_heads, _q_len, head_dim] = query.dims();
 
         let key = self.repeat_kv(key, num_heads / self.num_key_value_heads);
         let value = self.repeat_kv(value, num_heads / self.num_key_value_heads);
 
-        let mut attn_weights = query.matmul(key.swap_dims(2, 3)) / (head_dim as f64).sqrt();
+        // Use the exact numerical order Candle uses: multiply by the scale rather than divide.
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let mut attn_weights = query.matmul(key.swap_dims(2, 3)) * scale;
 
         if let Some(mask) = mask {
-            attn_weights = attn_weights.mask_fill(
-                mask.clone().unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0),
-                -f32::INFINITY,
-            );
+            let [_batch_size, num_heads, q_len, k_len] = attn_weights.dims();
+
+            let expanded_mask = mask
+                .clone()
+                .unsqueeze_dim::<4>(0) // [1, 1, q_len, k_len]
+                .expand([_batch_size, num_heads, q_len, k_len]);
+
+            attn_weights = attn_weights.mask_fill(expanded_mask, f32::NEG_INFINITY);
         }
 
         let attn_weights = activation::softmax(attn_weights, 3);
         let attn_output = attn_weights.matmul(value);
+
+        print_tensor("attn_output", &attn_output);
+
         attn_output
     }
 
@@ -327,10 +502,10 @@ impl<B: Backend> Attention<B> {
         if n_rep == 1 {
             return x;
         }
+
         let [batch_size, n_kv_heads, seq_len, head_dim] = x.dims();
-        x.unsqueeze_dim::<5>(2)
-            .expand([batch_size, n_kv_heads, n_rep, seq_len, head_dim])
-            .reshape([batch_size, n_kv_heads * n_rep, seq_len, head_dim])
+        let x_cat = Tensor::cat(vec![x; n_rep], 2);
+        x_cat.reshape([batch_size, n_kv_heads * n_rep, seq_len, head_dim])
     }
 }
 
@@ -364,4 +539,22 @@ impl<B: Backend> Mlp<B> {
         let x = activation::silu(self.gate_proj.forward(x.clone())) * self.up_proj.forward(x);
         self.down_proj.forward(x)
     }
+}
+
+fn tensor_hash<B: Backend, const D: usize>(t: &Tensor<B, D>) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let data = t.to_data();
+
+    let mut hasher = DefaultHasher::new();
+    for v in data.iter::<f32>() {
+        // Round to four decimal places (1e-4) to make the hash robust to minor
+        // numerical noise.
+        let quantised = (v * 10_000.0).round() as i32;
+        quantised.hash(&mut hasher);
+    }
+
+    // Return the 64-bit hash as a fixed-width hexadecimal string.
+    format!("{:016x}", hasher.finish())
 }

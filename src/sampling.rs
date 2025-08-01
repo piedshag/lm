@@ -11,14 +11,21 @@ pub enum Sampler<B: Backend> {
 }
 
 impl<B: Backend> Sampler<B> {
-    pub fn sample(&mut self, logits: Tensor<B, 2>) -> Tensor<B, 2, Int> {
+    pub fn sample(&mut self, logits: Tensor<B, 2>, temperature: f64) -> Tensor<B, 2, Int> {
+        // Apply temperature scaling to logits
+        let scaled_logits = if temperature != 1.0 {
+            logits / temperature
+        } else {
+            logits
+        };
+
         match self {
             Self::TopP(s) => {
-                // Convert logits to probabilities using softmax
-                let probs = activation::softmax(logits, 1);
+                // Convert scaled logits to probabilities using softmax
+                let probs = activation::softmax(scaled_logits, 1);
                 s.sample(probs)
             }
-            Self::Argmax => logits.argmax(1),
+            Self::Argmax => scaled_logits.argmax(1),
         }
     }
 }
@@ -39,7 +46,7 @@ pub struct TopP<B: Backend> {
 
 impl<B: Backend> TopP<B> {
     pub fn new(p: f64, seed: u64) -> Self {
-        let rng = StdRng::from_entropy();
+        let rng = StdRng::seed_from_u64(seed);
         Self {
             p,
             rng,
@@ -65,7 +72,7 @@ impl<B: Backend> Sampling<B> for TopP<B> {
             if cumsum >= self.p {
                 *x = 0.0;
             } else {
-                cumsum += *x as f64;
+                cumsum += *x;
             }
         });
 
