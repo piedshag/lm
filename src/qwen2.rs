@@ -1,3 +1,6 @@
+use std::path::Path;
+
+use crate::utils::print_tensor;
 use burn::{
     backend::{candle::CandleTensor, Candle},
     config::Config,
@@ -15,17 +18,6 @@ use burn::{
 use burn_import::safetensors::{AdapterType, LoadArgs, SafetensorsFileRecorder};
 use burn_ndarray::NdArrayTensor;
 use rand::seq;
-
-fn print_tensor<B: Backend, const D: usize>(name: &str, tensor: &Tensor<B, D>) {
-    return;
-
-    println!(
-        "{} shape {:?} hash {}",
-        name,
-        tensor.dims(),
-        tensor_hash(tensor)
-    );
-}
 
 fn rotate_half<B: Backend>(xs: Tensor<B, 4>) -> Tensor<B, 4> {
     let last_dim = xs.dims()[3];
@@ -175,7 +167,7 @@ impl<B: Backend> Qwen2Model<B> {
         }
     }
 
-    pub fn load(mut self, file_path: &str) -> Result<Self, RecorderError> {
+    pub fn load(mut self, file_path: &Path) -> Result<Self, RecorderError> {
         let recorder = SafetensorsFileRecorder::<FullPrecisionSettings>::new();
         let load_args = LoadArgs::new(file_path.into())
             .with_key_remap("model\\.(.+)", "$1")
@@ -185,33 +177,25 @@ impl<B: Backend> Qwen2Model<B> {
         let record = recorder.load(load_args, &self.device).unwrap();
         self.model = self.model.load_record(record);
 
-        load_lm_head(&mut self, file_path).unwrap();
+        load_lm_head(&mut self)?;
         Ok(self)
     }
 
     pub fn forward(&mut self, x: Tensor<B, 2, Int>, pos: usize) -> Tensor<B, 3> {
         let seq_len = x.dims()[1];
-        let now = std::time::Instant::now();
         let hidden_states = self
             .model
             .forward(x, pos, &mut self.cache, &self.rotary_emb)
             .narrow(1, seq_len - 1, 1);
 
         print_tensor("hidden_states", &hidden_states);
-
-        println!("lm_head: {:?}", self.lm_head.weight.val().dims());
         let output = self.lm_head.forward(hidden_states);
-        println!("forward time: {:?}", now.elapsed());
-
         print_tensor("output", &output);
         output
     }
 }
 
-pub fn load_lm_head<B: Backend>(
-    model: &mut Qwen2Model<B>,
-    file_path: &str,
-) -> Result<(), RecorderError> {
+pub fn load_lm_head<B: Backend>(model: &mut Qwen2Model<B>) -> Result<(), RecorderError> {
     // The small model uses tied embeddings, so we need to set the lm_head.weight to the
     // embed_tokens.weight
 
@@ -313,11 +297,6 @@ impl<B: Backend> DecoderLayer<B> {
         let post_attention_layernorm = nn::RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
             .init(device);
-
-        println!(
-            "post_attention_layernorm hidden_size: {}, rms_norm_eps: {}",
-            config.hidden_size, config.rms_norm_eps
-        );
 
         Self {
             self_attn,
@@ -539,22 +518,4 @@ impl<B: Backend> Mlp<B> {
         let x = activation::silu(self.gate_proj.forward(x.clone())) * self.up_proj.forward(x);
         self.down_proj.forward(x)
     }
-}
-
-fn tensor_hash<B: Backend, const D: usize>(t: &Tensor<B, D>) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let data = t.to_data();
-
-    let mut hasher = DefaultHasher::new();
-    for v in data.iter::<f32>() {
-        // Round to four decimal places (1e-4) to make the hash robust to minor
-        // numerical noise.
-        let quantised = (v * 10_000.0).round() as i32;
-        quantised.hash(&mut hasher);
-    }
-
-    // Return the 64-bit hash as a fixed-width hexadecimal string.
-    format!("{:016x}", hasher.finish())
 }
