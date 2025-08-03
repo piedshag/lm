@@ -2,7 +2,6 @@ use std::path::Path;
 
 use crate::utils::print_tensor;
 use burn::{
-    backend::{candle::CandleTensor, Candle},
     config::Config,
     module::{Module, Param},
     nn::{

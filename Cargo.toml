@@ -3,8 +3,12 @@ name = "lm"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+cpu = ["burn/candle"]
+metal = ["burn/metal", "burn/wgpu"]
+
 [dependencies]
-burn = { version = "0.18.0", features = ["ndarray", "metal", "wgpu", "candle", "tch"] }
+burn = { version = "0.18.0", features = ["ndarray"] }
 burn-import = "0.18.0"
 burn-common = "0.18.0"
 burn-candle = "0.18.0"
@@ -18,4 +22,7 @@ tokenizers = "0.21.2"
 rand = "0.8.5"
 serde_json = "1.0.141"
 clap = { version = "4.5.42", features = ["derive"] }
+log = "0.4.27"
+env_logger = "0.11.8"
+anyhow = "1.0.98"
 

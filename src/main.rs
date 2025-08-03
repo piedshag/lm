@@ -1,20 +1,21 @@
 #![recursion_limit = "256"]
 use crate::qwen2::{Qwen2Config, Qwen2Model};
 use crate::sampling::{Sampler, TopP};
-use burn::backend::{Metal, Wgpu};
+use anyhow::Result;
 use burn::tensor::Device;
 use burn::{
-    backend::candle::Candle,
     config::Config,
     module::Module,
     tensor::{activation, backend::Backend, Int, Shape, Tensor, TensorData},
 };
 use burn_ndarray::NdArray;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
+use log::info;
 use std::io::{self, Write};
 use std::time::Instant;
 use tokenizers::Tokenizer;
+
 mod bpe;
 mod qwen2;
 mod sampling;
@@ -30,49 +31,101 @@ struct Args {
     /// Maximum number of tokens to generate
     #[arg(short, long, default_value_t = 100)]
     max_tokens: usize,
+
+    /// The model to use
+    #[arg(short, long, default_value = "qwen2-0-5b")]
+    model: Models,
 }
 
-fn main() {
+#[derive(ValueEnum, Clone, Copy)]
+enum Models {
+    Qwen2_0_5B,
+    Qwen2_1_5B,
+}
+
+impl Models {
+    fn get_model_name(&self) -> String {
+        match self {
+            Models::Qwen2_0_5B => "Qwen/Qwen2-0.5B".to_string(),
+            Models::Qwen2_1_5B => "Qwen/Qwen2-1.5B".to_string(),
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
 
+    #[cfg(feature = "cpu")]
+    cpu::run(args)?;
+
+    #[cfg(feature = "metal")]
+    metal::run(args)?;
+
+    Ok(())
+}
+
+#[cfg(feature = "cpu")]
+mod cpu {
+    use super::*;
+    use burn::backend::candle::Candle;
+
     type MyBackend = Candle;
-    let device = Device::<MyBackend>::default();
 
-    let api = Api::new().unwrap();
-    let repo = api.model("Qwen/Qwen2-0.5B".to_string());
-    let model_file = repo.get("model.safetensors").unwrap();
-    let config_file = repo.get("config.json").unwrap();
-    let tokenizer_file = repo.get("tokenizer.json").unwrap();
+    pub fn run(args: Args) -> Result<()> {
+        let device = Device::<MyBackend>::default();
+        run_model::<MyBackend>(args, device)
+    }
+}
 
-    println!(
-        "config: {:?}",
-        std::fs::read_to_string(&config_file).unwrap()
-    );
+#[cfg(feature = "metal")]
+mod metal {
+    use super::*;
+    use burn::backend::{Metal, Wgpu};
 
-    let config = Qwen2Config::load(config_file).unwrap();
+    type MyBackend = Metal;
+
+    pub fn run(args: Args) -> Result<()> {
+        let device = Device::<MyBackend>::default();
+        run_model::<MyBackend>(args, device)
+    }
+}
+
+fn run_model<B: Backend>(args: Args, device: Device<B>) -> Result<()> {
+    let api = Api::new()?;
+    let repo = api.model(args.model.get_model_name());
+    let model_file = repo.get("model.safetensors")?;
+    let config_file = repo.get("config.json")?;
+    let tokenizer_file = repo.get("tokenizer.json")?;
+
+    info!("config: {:?}", std::fs::read_to_string(&config_file)?);
+
+    let config = Qwen2Config::load(config_file)?;
     let tokenizer = Tokenizer::from_file(tokenizer_file).unwrap();
 
-    let model: Qwen2Model<MyBackend> = Qwen2Model::new(&config, &device);
-    let model = model.load(&model_file).unwrap();
+    let model: Qwen2Model<B> = Qwen2Model::new(&config, &device);
+    let model = model.load(&model_file)?;
 
     print!("{}", args.prompt);
-    io::stdout().flush().unwrap();
+    io::stdout().flush()?;
 
     let start = Instant::now();
     let mut tokens_generated = 0u32;
     for token_piece in generate(model, tokenizer, &args.prompt, args.max_tokens) {
         print!("{}", token_piece);
-        io::stdout().flush().unwrap();
+        io::stdout().flush()?;
         tokens_generated += 1;
     }
     println!();
 
     let elapsed_secs = start.elapsed().as_secs_f64();
     let tps = tokens_generated as f64 / elapsed_secs;
-    println!(
+    info!(
         "Generated {} tokens in {:.2} seconds ({:.2} tokens/s)",
         tokens_generated, elapsed_secs, tps
     );
+
+    Ok(())
 }
 
 pub struct GenerateStream<B: Backend> {
